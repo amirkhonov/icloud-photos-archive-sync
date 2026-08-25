@@ -1,0 +1,11 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local operational artifacts; never publish machine-specific paths or reports.
+my-running-command.md
+sync-report.json
