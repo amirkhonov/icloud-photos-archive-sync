@@ -69,6 +69,20 @@ class SyncResult(TypedDict, total=False):
     issues: list[str]
 
 
+def parse_after(value: str) -> float:
+    """Parse an ISO-8601 cutoff as a Unix timestamp.
+
+    A date-only value starts at local midnight. Datetimes with an explicit UTC
+    offset are also accepted; naive datetimes use the local timezone.
+    """
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid ISO-8601 date/time: {value!r} (for example, 2024-01-01 or 2024-01-01T12:30:00)"
+        ) from exc
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
@@ -77,6 +91,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="copy files (default is dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="preview changes without copying")
     parser.add_argument("--limit", type=int, help="process at most this many source media files")
+    parser.add_argument(
+        "--after",
+        type=parse_after,
+        metavar="ISO_DATETIME",
+        help=(
+            "only process source media created or modified after this ISO-8601 date/time "
+            "(for example, 2024-01-01 or 2024-01-01T12:30:00)"
+        ),
+    )
     parser.add_argument("--report", type=Path, help="write the JSON report to this path")
     parser.add_argument(
         "--verbose", "-v",
@@ -154,8 +177,27 @@ def open_database_readonly(database: Path):
             yield connection
 
 
-def load_assets(database: Path, source: Path, limit: int | None = None) -> tuple[list[Asset], list[str]]:
-    """Read Photos metadata and match UUID-named resources in originals."""
+def source_is_created_or_modified_after(stat_result: os.stat_result, after: float) -> bool:
+    """Return whether source media was created or modified strictly after ``after``.
+
+    macOS exposes file creation time as ``st_birthtime``. On filesystems that
+    do not provide it, the modification time remains a safe, portable filter.
+    """
+    created = getattr(stat_result, "st_birthtime", None)
+    return stat_result.st_mtime > after or (isinstance(created, (int, float)) and created > after)
+
+
+def load_assets(
+    database: Path,
+    source: Path,
+    limit: int | None = None,
+    after: float | None = None,
+) -> tuple[list[Asset], list[str]]:
+    """Read Photos metadata and match UUID-named resources in originals.
+
+    When ``after`` is set, include only sources created or modified strictly
+    after that Unix timestamp.
+    """
     if limit == 0:
         return [], []
 
@@ -199,6 +241,13 @@ def load_assets(database: Path, source: Path, limit: int | None = None) -> tuple
         if metadata is None:
             issues.append(f"no Photos database record for: {path}")
             continue
+        if after is not None:
+            try:
+                if not source_is_created_or_modified_after(path.stat(), after):
+                    continue
+            except OSError as exc:
+                issues.append(f"unable to read source timestamps for {path}: {exc}")
+                continue
         name, captured = metadata
         matched.append(Asset(uuid, path, name, captured, match.group("part")))
         if limit is not None and len(matched) >= limit:
@@ -323,6 +372,13 @@ def sync(
 ) -> SyncResult:
     if progress_every <= 0:
         raise ValueError("progress_every must be positive")
+    # Process the archive chronologically regardless of filesystem discovery or
+    # caller-provided order. The remaining fields make equal capture times
+    # deterministic without mutating the caller's list.
+    assets = sorted(
+        assets,
+        key=lambda asset: (asset.captured, asset.uuid, asset.part or "", str(asset.source)),
+    )
     counts = Counter({
         "copied": 0,
         "skipped": 0,
@@ -457,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise SystemExit("target directory must not be inside the source directory")
     print("Scanning source directory and Photos database for assets to sync...", file=sys.stderr, flush=True)
-    assets, issues = load_assets(database, source, args.limit)
+    assets, issues = load_assets(database, source, args.limit, args.after)
     print(f"Found {len(assets)} assets to sync ({len(issues)} issues).", file=sys.stderr, flush=True)
     sidecar_renderer = None
     if args.sidecar:

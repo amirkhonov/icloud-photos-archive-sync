@@ -95,6 +95,19 @@ write:
 .venv/bin/python sync_photos_library.py --dry-run --limit 100
 ```
 
+**Preview only media added or changed after a date:**
+
+```sh
+.venv/bin/python sync_photos_library.py --after 2024-01-01 --limit 100 --verbose
+```
+
+`--after` accepts an ISO-8601 date or datetime. It includes a source media
+file only when its filesystem creation time or modification time is strictly
+later than the cutoff. Dates are interpreted at local midnight; datetimes with
+an explicit UTC offset are also supported. This filter uses the source file's
+filesystem timestamps, not the Photos capture date used to organize the
+archive.
+
 **Archive without XMP sidecars** using only the Python standard library:
 
 ```sh

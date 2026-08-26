@@ -1,10 +1,22 @@
+import os
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from sync_photos_library import DEFAULT_TARGET, Asset, has_sibling_sidecar, load_assets, parse_args, sidecar_path, sync
+from sync_photos_library import (
+    DEFAULT_TARGET,
+    Asset,
+    has_sibling_sidecar,
+    load_assets,
+    parse_args,
+    sidecar_path,
+    source_is_created_or_modified_after,
+    sync,
+)
 
 
 class StubSidecarRenderer:
@@ -64,6 +76,32 @@ def test_zero_limit_returns_no_assets(tmp_path):
     assets, issues = load_assets(database, source, limit=0)
     assert not assets
     assert not issues
+
+
+def test_after_filter_uses_source_modified_time(tmp_path):
+    source, database = make_fixture(tmp_path)
+    cutoff = time.time() + 60
+    for path in source.rglob("*"):
+        if path.is_file():
+            os.utime(path, (cutoff + 1, cutoff + 1))
+
+    assets, issues = load_assets(database, source, after=cutoff)
+
+    assert not issues
+    assert {asset.destination_name for asset in assets} == {"IMG_0001.HEIC", "IMG_0001.mov"}
+    assert not load_assets(database, source, after=cutoff + 2)[0]
+
+
+def test_after_filter_accepts_source_creation_time():
+    assert source_is_created_or_modified_after(SimpleNamespace(st_mtime=100, st_birthtime=200), 150)
+    assert not source_is_created_or_modified_after(SimpleNamespace(st_mtime=100), 150)
+
+
+def test_after_argument_parses_iso_datetime_and_rejects_invalid_value():
+    assert parse_args(["--after", "2024-01-01"]).after == datetime(2024, 1, 1).timestamp()
+
+    with pytest.raises(SystemExit):
+        parse_args(["--after", "not-a-date"])
 
 
 def test_identical_rerun_skips(tmp_path):
@@ -221,6 +259,20 @@ def test_sync_rejects_non_positive_progress_interval(tmp_path):
 
     with pytest.raises(ValueError, match="progress_every must be positive"):
         sync([asset], tmp_path / "archive", False, progress_every=0)
+
+
+def test_sync_processes_assets_by_capture_timestamp(tmp_path):
+    renderer = StubSidecarRenderer()
+    assets = [
+        Asset("newer", tmp_path / "newer.heic", "newer.HEIC", datetime(2020, 1, 2)),
+        Asset("same-b", tmp_path / "same-b.heic", "same-b.HEIC", datetime(2020, 1, 1)),
+        Asset("same-a", tmp_path / "same-a.heic", "same-a.HEIC", datetime(2020, 1, 1)),
+        Asset("older", tmp_path / "older.heic", "older.HEIC", datetime(2019, 12, 31)),
+    ]
+
+    sync(assets, tmp_path / "archive", False, sidecar_renderer=renderer)
+
+    assert renderer.rendered == ["older", "same-a", "same-b", "newer"]
 
 
 def test_live_photo_video_companion_trusted_via_sibling_image_sidecar(tmp_path):
