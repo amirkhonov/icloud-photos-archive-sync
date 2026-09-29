@@ -15,7 +15,7 @@ import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, TypedDict
 
@@ -83,6 +83,13 @@ def parse_after(value: str) -> float:
         ) from exc
 
 
+def parse_capture_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid capture date: {value!r} (expected YYYY-MM-DD)") from exc
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
@@ -100,6 +107,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(for example, 2024-01-01 or 2024-01-01T12:30:00)"
         ),
     )
+    parser.add_argument("--captured-from", type=parse_capture_date, metavar="YYYY-MM-DD",
+                        help="include photos captured on or after this local date")
+    parser.add_argument("--captured-before", type=parse_capture_date, metavar="YYYY-MM-DD",
+                        help="include photos captured before this local date")
     parser.add_argument("--report", type=Path, help="write the JSON report to this path")
     parser.add_argument(
         "--verbose", "-v",
@@ -192,6 +203,8 @@ def load_assets(
     source: Path,
     limit: int | None = None,
     after: float | None = None,
+    captured_from: date | None = None,
+    captured_before: date | None = None,
 ) -> tuple[list[Asset], list[str]]:
     """Read Photos metadata and match UUID-named resources in originals.
 
@@ -249,6 +262,10 @@ def load_assets(
                 issues.append(f"unable to read source timestamps for {path}: {exc}")
                 continue
         name, captured = metadata
+        if captured_from is not None and captured.date() < captured_from:
+            continue
+        if captured_before is not None and captured.date() >= captured_before:
+            continue
         matched.append(Asset(uuid, path, name, captured, match.group("part")))
         if limit is not None and len(matched) >= limit:
             break
@@ -506,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"Photos database does not exist: {database}")
     if args.limit is not None and args.limit < 0:
         raise SystemExit("--limit must be non-negative")
+    if args.captured_from and args.captured_before and args.captured_from >= args.captured_before:
+        raise SystemExit("--captured-from must be earlier than --captured-before")
     try:
         target.resolve().relative_to(source.resolve())
     except ValueError:
@@ -513,7 +532,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise SystemExit("target directory must not be inside the source directory")
     print("Scanning source directory and Photos database for assets to sync...", file=sys.stderr, flush=True)
-    assets, issues = load_assets(database, source, args.limit, args.after)
+    assets, issues = load_assets(database, source, args.limit, args.after,
+                                 args.captured_from, args.captured_before)
     print(f"Found {len(assets)} assets to sync ({len(issues)} issues).", file=sys.stderr, flush=True)
     sidecar_renderer = None
     if args.sidecar:

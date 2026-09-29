@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -102,6 +102,31 @@ def test_after_argument_parses_iso_datetime_and_rejects_invalid_value():
 
     with pytest.raises(SystemExit):
         parse_args(["--after", "not-a-date"])
+
+
+def test_capture_date_range_includes_august_and_september_only(tmp_path):
+    source, database = make_fixture(tmp_path)
+    dates = [
+        ("11111111-1111-1111-1111-111111111111", datetime(2026, 7, 31, 23, 59)),
+        ("22222222-2222-2222-2222-222222222222", datetime(2026, 8, 1)),
+        ("33333333-3333-3333-3333-333333333333", datetime(2026, 9, 30, 23, 59)),
+        ("44444444-4444-4444-4444-444444444444", datetime(2026, 10, 1)),
+    ]
+    with sqlite3.connect(database) as db:
+        for key, (uuid, captured) in enumerate(dates, start=2):
+            (source / "A" / f"{uuid}.jpg").write_bytes(uuid.encode())
+            db.execute("INSERT INTO ZASSET VALUES (?, ?, ?, ?)",
+                       (key, uuid, f"IMG_{key}.JPG", captured.timestamp() - 978307200))
+
+    assets, issues = load_assets(database, source, captured_from=date(2026, 8, 1),
+                                 captured_before=date(2026, 10, 1))
+
+    assert not issues
+    assert {asset.uuid for asset in assets} == {dates[1][0], dates[2][0]}
+    assert parse_args(["--captured-from", "2026-08-01",
+                       "--captured-before", "2026-10-01"]).captured_from == date(2026, 8, 1)
+    with pytest.raises(SystemExit):
+        parse_args(["--captured-from", "not-a-date"])
 
 
 def test_identical_rerun_skips(tmp_path):
@@ -298,4 +323,3 @@ def test_live_photo_video_companion_trusted_via_sibling_image_sidecar(tmp_path):
     assert result["counts"].get("conflict", 0) == 0
     # the video companion still gets no sidecar of its own
     assert not sidecar_path(mov).exists()
-

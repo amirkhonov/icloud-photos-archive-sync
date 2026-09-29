@@ -108,6 +108,19 @@ an explicit UTC offset are also supported. This filter uses the source file's
 filesystem timestamps, not the Photos capture date used to organize the
 archive.
 
+**Sync photos captured in a calendar date range:**
+
+```sh
+.venv/bin/python sync_photos_library.py \
+  --captured-from 2026-08-01 --captured-before 2026-10-01 \
+  --target "$HOME/photosarchiveamir" --dry-run
+```
+
+`--captured-from` includes its date; `--captured-before` excludes its date.
+These use the Photos capture date that determines the archive's `YYYY/MM/DD`
+directory, so the example selects August and September 2026. Add `--apply`
+instead of `--dry-run` after reviewing the preview.
+
 **Archive without XMP sidecars** using only the Python standard library:
 
 ```sh

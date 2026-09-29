@@ -8,4 +8,4 @@ htmlcov/
 
 # Local operational artifacts; never publish machine-specific paths or reports.
 my-running-command.md
-sync-report.json
+sync-report*.json
