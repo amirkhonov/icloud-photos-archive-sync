@@ -48,11 +48,11 @@ def make_fixture(tmp_path: Path):
     with sqlite3.connect(database) as db:
         db.executescript("""
             CREATE TABLE ZASSET (Z_PK INTEGER PRIMARY KEY, ZUUID TEXT,
-              ZFILENAME TEXT, ZDATECREATED REAL);
+              ZFILENAME TEXT, ZDATECREATED REAL, ZTRASHEDSTATE INTEGER DEFAULT 0);
             CREATE TABLE ZADDITIONALASSETATTRIBUTES (ZASSET INTEGER,
               ZORIGINALFILENAME TEXT);
         """)
-        db.execute("INSERT INTO ZASSET VALUES (1, ?, ?, ?)",
+        db.execute("INSERT INTO ZASSET (Z_PK, ZUUID, ZFILENAME, ZDATECREATED) VALUES (1, ?, ?, ?)",
                    ("ABCDEF12-3456-7890-ABCD-EF1234567890",
                     "ABCDEF12-3456-7890-ABCD-EF1234567890.heic", 0))
         db.execute("INSERT INTO ZADDITIONALASSETATTRIBUTES VALUES (1, ?)", ("IMG_0001.HEIC",))
@@ -115,7 +115,7 @@ def test_capture_date_range_includes_august_and_september_only(tmp_path):
     with sqlite3.connect(database) as db:
         for key, (uuid, captured) in enumerate(dates, start=2):
             (source / "A" / f"{uuid}.jpg").write_bytes(uuid.encode())
-            db.execute("INSERT INTO ZASSET VALUES (?, ?, ?, ?)",
+            db.execute("INSERT INTO ZASSET (Z_PK, ZUUID, ZFILENAME, ZDATECREATED) VALUES (?, ?, ?, ?)",
                        (key, uuid, f"IMG_{key}.JPG", captured.timestamp() - 978307200))
 
     assets, issues = load_assets(database, source, captured_from=date(2026, 8, 1),
@@ -141,7 +141,7 @@ def test_identical_rerun_skips(tmp_path):
 def test_duplicate_uuid_reported_as_issue(tmp_path):
     source, database = make_fixture(tmp_path)
     with sqlite3.connect(database) as db:
-        db.execute("INSERT INTO ZASSET VALUES (2, ?, ?, ?)",
+        db.execute("INSERT INTO ZASSET (Z_PK, ZUUID, ZFILENAME, ZDATECREATED) VALUES (2, ?, ?, ?)",
                    ("ABCDEF12-3456-7890-ABCD-EF1234567890",
                     "IMG_9999.HEIC", 1000))
         db.commit()
@@ -323,3 +323,82 @@ def test_live_photo_video_companion_trusted_via_sibling_image_sidecar(tmp_path):
     assert result["counts"].get("conflict", 0) == 0
     # the video companion still gets no sidecar of its own
     assert not sidecar_path(mov).exists()
+
+
+def test_trashed_assets_are_excluded_without_issues(tmp_path):
+    """Items in Recently Deleted still have originals on disk; they must be
+    skipped without being misreported as missing a database record."""
+    source, database = make_fixture(tmp_path)
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE ZASSET SET ZTRASHEDSTATE = 1")
+
+    assets, issues = load_assets(database, source)
+
+    assert assets == []
+    assert issues == []
+
+
+def test_trashed_duplicate_does_not_conflict_with_live_asset(tmp_path):
+    source, database = make_fixture(tmp_path)
+    trashed_uuid = "11111111-1111-1111-1111-111111111111"
+    (source / "A" / f"{trashed_uuid}.heic").write_bytes(b"photo")
+    with sqlite3.connect(database) as db:
+        db.execute("INSERT INTO ZASSET (Z_PK, ZUUID, ZFILENAME, ZDATECREATED, ZTRASHEDSTATE) VALUES (2, ?, ?, 0, 1)",
+                   (trashed_uuid, "IMG_0001.HEIC"))
+
+    assets, issues = load_assets(database, source)
+    result = sync(assets, tmp_path / "archive", True)
+
+    assert not issues
+    assert trashed_uuid not in {asset.uuid for asset in assets}
+    assert result["counts"]["conflict"] == 0
+    assert (tmp_path / "archive/2001/01/01/IMG_0001.HEIC").read_bytes() == b"photo"
+
+
+APPLEDOUBLE = b"\x00\x05\x16\x07" + b"\x00" * 60
+
+
+def seed_appledouble(target: Path) -> dict[str, Path]:
+    """AppleDouble files at each level, plus files the cleanup must not touch."""
+    day = target / "2001/01/01"
+    day.mkdir(parents=True)
+    other_day = target / "1999/12/31"
+    other_day.mkdir(parents=True)
+    paths = {
+        "day": day / "._IMG_0001.HEIC",
+        "day_directory": day.parent / "._01",
+        "root": target / "._2001",
+        "real_file": day / "._real.txt",
+        "untouched_directory": other_day / "._IMG_9999.HEIC",
+    }
+    for key, path in paths.items():
+        path.write_bytes(b"not appledouble" if key == "real_file" else APPLEDOUBLE)
+    return paths
+
+
+def test_apply_removes_appledouble_files_only_where_it_wrote(tmp_path):
+    source, database = make_fixture(tmp_path)
+    assets, _ = load_assets(database, source)
+    target = tmp_path / "archive"
+    paths = seed_appledouble(target)
+
+    result = sync(assets, target, True, sidecar_renderer=StubSidecarRenderer())
+
+    assert result["counts"]["appledouble_removed"] == 3
+    for key in ("day", "day_directory", "root"):
+        assert not paths[key].exists()
+    assert paths["real_file"].read_bytes() == b"not appledouble"
+    assert paths["untouched_directory"].exists()
+    assert (target / "2001/01/01/IMG_0001.HEIC").read_bytes() == b"photo"
+
+
+def test_dry_run_leaves_appledouble_files(tmp_path):
+    source, database = make_fixture(tmp_path)
+    assets, _ = load_assets(database, source)
+    target = tmp_path / "archive"
+    paths = seed_appledouble(target)
+
+    result = sync(assets, target, False)
+
+    assert result["counts"]["appledouble_removed"] == 0
+    assert all(path.exists() for path in paths.values())

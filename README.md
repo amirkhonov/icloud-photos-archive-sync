@@ -15,6 +15,10 @@ to their original camera/import filenames through `Photos.sqlite`.
 - Verifies existing media by size and SHA-256; identical files are skipped.
 - Reports, but never overwrites, same-name files with differing content.
 - Skips Photos `.AAE` edit-instruction sidecars.
+- Skips items in Recently Deleted. Copies already in the archive are left in
+  place; the tool never deletes archived media.
+- Removes macOS `._*` AppleDouble files from directories it writes to during
+  `--apply`, so they are not uploaded when the target is an rclone mount.
 - Optionally generates `<mediafile>.xmp` metadata sidecars with faces,
   keywords, GPS, and dates from the current Photos library.
 - Uses atomic media, XMP, and JSON-report writes so interrupted writes do not

@@ -23,6 +23,12 @@ Apple Core Data stores dates as seconds since **2001-01-01**, not Unix epoch. Th
 ### `.AAE` files are always skipped
 They are Photos edit-instruction side-cars and intentionally excluded (see `load_assets`).
 
+### Recently Deleted assets are always skipped
+`load_assets` excludes assets with a non-zero `ZTRASHEDSTATE`. Their originals stay on disk until Photos purges them, so `load_assets` keeps their UUIDs in `trashed` and skips those files silently; otherwise they would be misreported as having no database record. Archived copies of items trashed later are left in place.
+
+### AppleDouble cleanup (`remove_appledouble_files`)
+macOS stores xattrs as `._*` files on filesystems without native xattr support. On the fuse-t NFS `rclone mount`, these appear even with `--noappledouble` and upload as real objects. After an `--apply` run, `sync()` removes them from each written directory and its ancestors up to the target, checking the AppleDouble magic number first. Directories it did not write to are not cleaned.
+
 ### Lock-aware SQLite reads (`open_database_readonly`)
 Reading `Photos.sqlite` directly via `mode=ro` blocks/retries against sqlite's busy-timeout when Photos.app or `photoanalysisd` holds the DB open in WAL mode — slow, especially over a slow/external volume. Mirroring `osxphotos.sqlite_utils.sqlite_open_ro_with_temp_copy`, `open_database_readonly()` first probes with `_sqlite_db_is_locked()`; only if locked does it copy the db plus its `-wal`/`-shm` side-cars to a local temp dir and query that snapshot instead. Note: `osxphotos.PhotosDB` (used by `SidecarRenderer`) is a much heavier full-library load (persons, faces, albums, moments) — not a faster alternative to our own lean 3-column query.
 

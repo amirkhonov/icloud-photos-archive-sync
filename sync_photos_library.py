@@ -23,6 +23,7 @@ UUID_RE = re.compile(r"^(?P<uuid>[0-9A-Fa-f-]{36})(?:_(?P<part>\d+))?(?:\.[^.]+)
 DEFAULT_SOURCE = Path("/Volumes/External/Photos Library.photoslibrary/originals")
 DEFAULT_DB = Path("/Volumes/External/Photos Library.photoslibrary/database/Photos.sqlite")
 DEFAULT_TARGET = Path.home() / "PhotosArchive"
+APPLEDOUBLE_MAGIC = b"\x00\x05\x16\x07"
 
 # CLI flags kept as deprecated aliases for --sidecar/--no-sidecar.
 _DEPRECATED_SIDECAR_FLAGS = ("--exiftool", "--no-exiftool")
@@ -215,14 +216,21 @@ def load_assets(
         return [], []
 
     assets: dict[str, tuple[str, datetime]] = {}
+    # Assets in Recently Deleted keep their originals on disk until Photos
+    # purges them. Remember them so those files are skipped silently instead of
+    # being reported as having no database record.
+    trashed: set[str] = set()
     issues: list[str] = []
     with open_database_readonly(database) as connection:
         rows = connection.execute(
-            """SELECT a.ZUUID, COALESCE(x.ZORIGINALFILENAME, a.ZFILENAME), a.ZDATECREATED
+            """SELECT a.ZUUID, COALESCE(x.ZORIGINALFILENAME, a.ZFILENAME), a.ZDATECREATED, a.ZTRASHEDSTATE
                FROM ZASSET a LEFT JOIN ZADDITIONALASSETATTRIBUTES x ON x.ZASSET=a.Z_PK
                WHERE a.ZUUID IS NOT NULL AND a.ZDATECREATED IS NOT NULL"""
         )
-        for uuid, name, timestamp in rows:
+        for uuid, name, timestamp, trashed_state in rows:
+            if trashed_state:
+                trashed.add(str(uuid).upper())
+                continue
             if not name or timestamp is None:
                 continue
             try:
@@ -250,6 +258,8 @@ def load_assets(
             issues.append(f"unrecognized source filename: {path}")
             continue
         uuid = match.group("uuid").upper()
+        if uuid in trashed:
+            continue
         metadata = assets.get(uuid)
         if metadata is None:
             issues.append(f"no Photos database record for: {path}")
@@ -379,6 +389,28 @@ def write_text_atomic(destination: Path, content: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def remove_appledouble_files(directory: Path) -> int:
+    """Delete macOS `._*` AppleDouble files directly inside `directory`.
+
+    macOS stores extended attributes in these files on filesystems without
+    native xattr support, such as an rclone NFS mount, where they would
+    otherwise upload as real objects. Only regular files that start with the
+    AppleDouble magic number are removed, so a real file that merely has a
+    `._` name survives.
+    """
+    removed = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.name.startswith("._") or not entry.is_file(follow_symlinks=False):
+                continue
+            with open(entry.path, "rb") as handle:
+                is_appledouble = handle.read(len(APPLEDOUBLE_MAGIC)) == APPLEDOUBLE_MAGIC
+            if is_appledouble:
+                os.unlink(entry.path)
+                removed += 1
+    return removed
+
+
 def sync(
     assets: list[Asset],
     target: Path,
@@ -404,6 +436,7 @@ def sync(
         "failure": 0,
         "sidecar_written": 0,
         "sidecar_skipped": 0,
+        "appledouble_removed": 0,
     })
     details: dict[str, list[str]] = {
         key: []
@@ -413,6 +446,7 @@ def sync(
         )
     }
     planned: dict[Path, Asset] = {}
+    written_directories: set[Path] = set()
     total = len(assets)
 
     def _progress(label: str, detail: str = "", force: bool = False) -> None:
@@ -475,6 +509,7 @@ def sync(
                     continue
             else:
                 if apply:
+                    written_directories.add(destination.parent)
                     copy_atomic(asset.source, destination)
                 counts["copied"] += 1
                 details["copied"].append(str(destination))
@@ -494,6 +529,7 @@ def sync(
                 existing_content = dest_sidecar.read_text(encoding="utf-8") if dest_sidecar.exists() else None
                 if existing_content != new_content:
                     if apply:
+                        written_directories.add(dest_sidecar.parent)
                         write_text_atomic(dest_sidecar, new_content)
                     counts["sidecar_written"] += 1
                     details["sidecar_written"].append(str(dest_sidecar))
@@ -509,6 +545,19 @@ def sync(
             counts["failure"] += 1
             details["failures"].append(f"{asset.source}: {exc}")
             _progress("failure", f"{asset.source}: {exc}", force=True)
+
+    # Creating YYYY/MM/DD directories leaves AppleDouble files beside them too,
+    # so clean each written directory's ancestors up to the target as well.
+    directories_to_clean = set(written_directories)
+    for directory in written_directories:
+        directories_to_clean.update(
+            parent for parent in directory.parents if parent == target or target in parent.parents
+        )
+    for directory in sorted(directories_to_clean):
+        try:
+            counts["appledouble_removed"] += remove_appledouble_files(directory)
+        except OSError as exc:
+            print(f"warning: could not clean AppleDouble files in {directory}: {exc}", file=sys.stderr, flush=True)
     return {"counts": dict(counts), **details}
 
 
