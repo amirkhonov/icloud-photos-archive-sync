@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import time
@@ -12,7 +13,9 @@ from sync_photos_library import (
     Asset,
     has_sibling_sidecar,
     load_assets,
+    main,
     parse_args,
+    scan_library,
     sidecar_path,
     source_is_created_or_modified_after,
     sync,
@@ -402,3 +405,166 @@ def test_dry_run_leaves_appledouble_files(tmp_path):
 
     assert result["counts"]["appledouble_removed"] == 0
     assert all(path.exists() for path in paths.values())
+
+
+CLOUD_ONLY_UUID = "22222222-2222-2222-2222-222222222222"
+
+
+def add_asset(database: Path, pk: int, uuid: str, name: str, timestamp: float = 0, **columns) -> None:
+    """Insert a ZASSET row, adding any extra columns the fixture lacks."""
+    with sqlite3.connect(database) as db:
+        existing = {row[1] for row in db.execute("PRAGMA table_info(ZASSET)")}
+        for column in columns:
+            if column not in existing:
+                db.execute(f"ALTER TABLE ZASSET ADD COLUMN {column}")
+        names = ["Z_PK", "ZUUID", "ZFILENAME", "ZDATECREATED", *columns]
+        placeholders = ", ".join("?" for _ in names)
+        db.execute(f"INSERT INTO ZASSET ({', '.join(names)}) VALUES ({placeholders})",
+                   (pk, uuid, name, timestamp, *columns.values()))
+
+
+def test_asset_without_local_original_is_reported_as_missing(tmp_path):
+    """With "Optimize Mac Storage", Photos keeps some originals only in iCloud.
+    They cannot be archived, so they must be reported, not silently ignored."""
+    source, database = make_fixture(tmp_path)
+    add_asset(database, 2, CLOUD_ONLY_UUID, "IMG_0002.HEIC")
+
+    scan = scan_library(database, source)
+
+    assert not scan.issues
+    assert [asset.destination_name for asset in scan.assets] == ["IMG_0001.HEIC", "IMG_0001.mov"]
+    assert len(scan.missing_originals) == 1
+    assert scan.missing_originals[0].startswith(f"{CLOUD_ONLY_UUID} IMG_0002.HEIC")
+
+
+def test_missing_originals_are_reported_beyond_limit_and_after_filters(tmp_path):
+    source, database = make_fixture(tmp_path)
+    add_asset(database, 2, CLOUD_ONLY_UUID, "IMG_0002.HEIC")
+
+    scan = scan_library(database, source, limit=1, after=time.time() + 3600)
+
+    assert scan.assets == []
+    assert len(scan.missing_originals) == 1
+
+
+def test_missing_originals_respect_capture_date_range(tmp_path):
+    source, database = make_fixture(tmp_path)
+    add_asset(database, 2, CLOUD_ONLY_UUID, "IMG_0002.HEIC")  # captured 2001-01-01
+
+    scan = scan_library(database, source, captured_from=date(2001, 1, 2))
+
+    assert scan.missing_originals == []
+
+
+def test_limit_still_detects_originals_present_past_the_cutoff(tmp_path):
+    source, database = make_fixture(tmp_path)
+    later_uuid = "FFFFFFFF-0000-0000-0000-000000000000"  # sorts after the fixture's files
+    (source / "A" / f"{later_uuid}.heic").write_bytes(b"later")
+    add_asset(database, 2, later_uuid, "IMG_0002.HEIC")
+
+    scan = scan_library(database, source, limit=1)
+
+    assert len(scan.assets) == 1
+    assert scan.missing_originals == []
+
+
+@pytest.mark.parametrize("columns", [
+    {"ZSAVEDASSETTYPE": 10},  # referenced file, stored outside the library
+    {"ZSAVEDASSETTYPE": 4},  # shared iCloud album photo
+    {"ZCLOUDBATCHPUBLISHDATE": 700000000.0},  # shared iCloud album photo
+    {"ZMOMENTSHARE": 1},  # shared moment / iCloud link
+])
+def test_assets_stored_outside_originals_are_not_reported_missing(tmp_path, columns):
+    source, database = make_fixture(tmp_path)
+    add_asset(database, 2, CLOUD_ONLY_UUID, "IMG_0002.HEIC", **columns)
+
+    assert scan_library(database, source).missing_originals == []
+
+
+def test_shared_with_you_assets_are_not_reported_missing(tmp_path):
+    source, database = make_fixture(tmp_path)
+    add_asset(database, 2, CLOUD_ONLY_UUID, "IMG_0002.HEIC")
+    with sqlite3.connect(database) as db:
+        db.execute("ALTER TABLE ZADDITIONALASSETATTRIBUTES ADD COLUMN ZSYNDICATIONIDENTIFIER")
+        db.execute("INSERT INTO ZADDITIONALASSETATTRIBUTES VALUES (2, 'IMG_0002.HEIC', 'syndication-id')")
+
+    assert scan_library(database, source).missing_originals == []
+
+
+def test_trashed_asset_without_original_is_not_reported_missing(tmp_path):
+    source, database = make_fixture(tmp_path)
+    add_asset(database, 2, CLOUD_ONLY_UUID, "IMG_0002.HEIC", ZTRASHEDSTATE=1)
+
+    assert scan_library(database, source).missing_originals == []
+
+
+def test_main_reports_missing_originals_and_exits_nonzero(tmp_path, capsys):
+    source, database = make_fixture(tmp_path)
+    add_asset(database, 2, CLOUD_ONLY_UUID, "IMG_0002.HEIC")
+    report = tmp_path / "report.json"
+
+    exit_code = main([
+        "--source", str(source), "--database", str(database),
+        "--target", str(tmp_path / "archive"), "--no-sidecar", "--report", str(report),
+    ])
+
+    captured = capsys.readouterr()
+    result = json.loads(report.read_text())
+    assert exit_code == 1
+    assert result["counts"]["missing_original"] == 1
+    assert result["missing_originals"][0].startswith(CLOUD_ONLY_UUID)
+    assert "Download Originals to this Mac" in captured.err
+
+
+def test_main_exits_zero_when_every_original_is_present(tmp_path):
+    source, database = make_fixture(tmp_path)
+
+    exit_code = main([
+        "--source", str(source), "--database", str(database),
+        "--target", str(tmp_path / "archive"), "--no-sidecar",
+    ])
+
+    assert exit_code == 0
+
+
+def test_unrelated_sibling_sidecar_does_not_hide_conflict(tmp_path):
+    """A RAW+JPEG pair shares a stem. A sidecar for the RAW half must not make a
+    differing, sidecar-less JPEG look like trusted legacy output."""
+    jpeg_source = tmp_path / "source.jpg"
+    jpeg_source.write_bytes(b"jpeg")
+    asset = Asset("uuid", jpeg_source, "IMG_1234.JPG", datetime(2020, 1, 1))
+    target = tmp_path / "archive"
+    day = target / "2020/01/01"
+    day.mkdir(parents=True)
+    (day / "IMG_1234.JPG").write_bytes(b"different jpeg")
+    (day / "IMG_1234.CR2").write_bytes(b"raw")
+    sidecar_path(day / "IMG_1234.CR2").write_text("<xmp>raw</xmp>")
+
+    result = sync([asset], target, False)
+
+    assert result["counts"]["conflict"] == 1
+    assert result["counts"]["legacy"] == 0
+
+
+def test_sibling_sidecar_lookup_escapes_glob_characters(tmp_path):
+    # Unescaped, the stem "IMG [1]" is a glob class that matches "IMG 1".
+    (tmp_path / "IMG 1.HEIC.xmp").write_text("<xmp/>")
+    assert not has_sibling_sidecar(tmp_path / "IMG [1].mov")
+
+    (tmp_path / "IMG [1].HEIC.xmp").write_text("<xmp/>")
+    assert has_sibling_sidecar(tmp_path / "IMG [1].mov")
+
+
+def test_installed_osxphotos_matches_sidecar_renderer_api():
+    """CI pins osxphotos; fail loudly if its sidecar API drifts from what
+    SidecarRenderer calls, since the stubbed tests cannot detect that."""
+    pytest.importorskip("osxphotos")
+    import inspect
+
+    from osxphotos.exportoptions import ExportOptions
+    from osxphotos.sidecars import SidecarWriter
+
+    assert ExportOptions(use_persons_as_keywords=True).use_persons_as_keywords is True
+    parameters = inspect.signature(SidecarWriter.xmp_sidecar).parameters
+    assert {"options", "extension"} <= parameters.keys()
+    assert "photo" in inspect.signature(SidecarWriter).parameters

@@ -1,3 +1,5 @@
 # Only needed for default --sidecar metadata generation. Plain --no-sidecar
 # sync mode uses only the Python standard library.
-osxphotos
+# Pinned to a tested minor series: SidecarRenderer depends on osxphotos's
+# sidecar API, which is not guaranteed stable across minor releases.
+osxphotos>=0.76.1,<0.77

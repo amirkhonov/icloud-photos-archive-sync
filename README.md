@@ -17,6 +17,8 @@ to their original camera/import filenames through `Photos.sqlite`.
 - Skips Photos `.AAE` edit-instruction sidecars.
 - Skips items in Recently Deleted. Copies already in the archive are left in
   place; the tool never deletes archived media.
+- Reports assets whose original is not on disk, for example when Photos uses
+  "Optimize Mac Storage" and keeps originals only in iCloud.
 - Removes macOS `._*` AppleDouble files from directories it writes to during
   `--apply`, so they are not uploaded when the target is an rclone mount.
 - Optionally generates `<mediafile>.xmp` metadata sidecars with faces,
@@ -117,7 +119,7 @@ archive.
 ```sh
 .venv/bin/python sync_photos_library.py \
   --captured-from 2026-08-01 --captured-before 2026-10-01 \
-  --target "$HOME/photosarchiveamir" --dry-run
+  --target "$HOME/PhotosArchive" --dry-run
 ```
 
 `--captured-from` includes its date; `--captured-before` excludes its date.
@@ -168,12 +170,37 @@ sidecar. A mismatch without a sidecar is a `conflict` and is never overwritten.
 - The target cannot be inside the source directory.
 - A JSON report is printed to standard output. `--report PATH` additionally
   writes it atomically to `PATH`.
-- Exit status is `0` for a clean run and `1` for conflicts, failures, or
-  unresolved source/database issues. `legacy` and sidecar updates are not
-  errors.
+- Assets whose original should be in `originals` but is not on disk are listed
+  in the report's `missing_originals` and counted as `missing_original`. This
+  check covers the whole library (within any `--captured-from` /
+  `--captured-before` range), even with `--limit` or `--after`. Shared-album,
+  "Shared with You", and referenced (not copied into the library) items are not
+  expected in `originals` and are not reported.
+- Exit status is `0` for a clean run and `1` for conflicts, failures, missing
+  originals, or unresolved source/database issues. `legacy` and sidecar updates
+  are not errors.
 
 The repository ignores `my-running-command.md` and `sync-report.json` so
 machine-specific commands and operational reports are not published.
+
+## Limitations
+
+- **Originals must be downloaded.** The tool copies only originals present on
+  disk. If Photos uses "Optimize Mac Storage", select "Download Originals to
+  this Mac" in Photos > Settings > iCloud and wait for the download to finish;
+  until then, the affected assets are reported as missing originals.
+- **Archive dates use the Mac's time zone.** The `YYYY/MM/DD` folder comes from
+  the capture time converted to the Mac's current local time zone, not the time
+  zone where the photo was taken. A photo taken late in the evening while
+  traveling can be filed under the neighboring day.
+- **Original filenames must be unique per day.** Two different assets with the
+  same original filename and capture date (for example `IMG_0001.JPG` from two
+  cameras) map to the same destination. The second is reported as a conflict
+  and is not archived; it is never renamed or overwritten.
+- **Edited versions are not archived.** Only originals are copied; Photos edits
+  are not rendered or exported.
+- Developed against the Photos library schema of recent macOS releases
+  (`ZASSET` table). Older libraries are not supported.
 
 ## Development
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import glob
 import hashlib
 import json
 import os
@@ -199,6 +200,38 @@ def source_is_created_or_modified_after(stat_result: os.stat_result, after: floa
     return stat_result.st_mtime > after or (isinstance(created, (int, float)) and created > after)
 
 
+@dataclass
+class LibraryScan:
+    assets: list[Asset]
+    issues: list[str]
+    # Assets whose original should be in ``originals`` but is not on disk,
+    # typically because "Optimize Mac Storage" left it in iCloud only.
+    missing_originals: list[str]
+
+
+# Conditions marking assets whose original never lives in the library's
+# ``originals`` directory, keyed by the (table alias, column) they need. Each
+# is applied only when the column exists, so older schemas still work.
+_NON_LOCAL_ORIGINAL_CONDITIONS = {
+    ("a", "ZSAVEDASSETTYPE"): "a.ZSAVEDASSETTYPE IN (4, 10)",  # shared album / referenced file
+    ("a", "ZCLOUDBATCHPUBLISHDATE"): "a.ZCLOUDBATCHPUBLISHDATE IS NOT NULL",  # shared album
+    ("a", "ZMOMENTSHARE"): "a.ZMOMENTSHARE IS NOT NULL",  # shared moment / iCloud link
+    ("x", "ZSYNDICATIONIDENTIFIER"): "x.ZSYNDICATIONIDENTIFIER IS NOT NULL",  # Shared with You
+}
+
+
+def _local_original_expression(connection: sqlite3.Connection) -> str:
+    """SQL expression that is 1 when an asset's original belongs in ``originals``."""
+    columns = {
+        "a": {row[1] for row in connection.execute("PRAGMA table_info(ZASSET)")},
+        "x": {row[1] for row in connection.execute("PRAGMA table_info(ZADDITIONALASSETATTRIBUTES)")},
+    }
+    conditions = [sql for (alias, column), sql in _NON_LOCAL_ORIGINAL_CONDITIONS.items() if column in columns[alias]]
+    if not conditions:
+        return "1"
+    return f"CASE WHEN {' OR '.join(conditions)} THEN 0 ELSE 1 END"
+
+
 def load_assets(
     database: Path,
     source: Path,
@@ -207,15 +240,32 @@ def load_assets(
     captured_from: date | None = None,
     captured_before: date | None = None,
 ) -> tuple[list[Asset], list[str]]:
+    """Return ``(assets, issues)``; see ``scan_library``."""
+    scan = scan_library(database, source, limit, after, captured_from, captured_before)
+    return scan.assets, scan.issues
+
+
+def scan_library(
+    database: Path,
+    source: Path,
+    limit: int | None = None,
+    after: float | None = None,
+    captured_from: date | None = None,
+    captured_before: date | None = None,
+) -> LibraryScan:
     """Read Photos metadata and match UUID-named resources in originals.
 
     When ``after`` is set, include only sources created or modified strictly
-    after that Unix timestamp.
+    after that Unix timestamp. Assets in the capture-date range whose original
+    is absent from ``source`` are listed in ``missing_originals`` regardless of
+    ``limit`` and ``after``, because they can never be archived from disk.
     """
     if limit == 0:
-        return [], []
+        return LibraryScan([], [], [])
 
     assets: dict[str, tuple[str, datetime]] = {}
+    # UUIDs whose original is expected on disk in ``originals``.
+    expected_local: set[str] = set()
     # Assets in Recently Deleted keep their originals on disk until Photos
     # purges them. Remember them so those files are skipped silently instead of
     # being reported as having no database record.
@@ -223,15 +273,16 @@ def load_assets(
     issues: list[str] = []
     with open_database_readonly(database) as connection:
         rows = connection.execute(
-            """SELECT a.ZUUID, COALESCE(x.ZORIGINALFILENAME, a.ZFILENAME), a.ZDATECREATED, a.ZTRASHEDSTATE
+            f"""SELECT a.ZUUID, COALESCE(x.ZORIGINALFILENAME, a.ZFILENAME), a.ZDATECREATED, a.ZTRASHEDSTATE,
+                       {_local_original_expression(connection)}
                FROM ZASSET a LEFT JOIN ZADDITIONALASSETATTRIBUTES x ON x.ZASSET=a.Z_PK
                WHERE a.ZUUID IS NOT NULL AND a.ZDATECREATED IS NOT NULL"""
         )
-        for uuid, name, timestamp, trashed_state in rows:
+        for uuid, name, timestamp, trashed_state, local_original in rows:
             if trashed_state:
                 trashed.add(str(uuid).upper())
                 continue
-            if not name or timestamp is None:
+            if not name:
                 continue
             try:
                 captured = datetime.fromtimestamp(float(timestamp) + 978307200)
@@ -246,18 +297,36 @@ def load_assets(
                 issues.append(f"invalid original filename for {key}: {name!r}")
                 continue
             assets[key] = (original_name, captured)
+            if local_original:
+                expected_local.add(key)
+
+    def in_capture_range(captured: datetime) -> bool:
+        return not (
+            (captured_from is not None and captured.date() < captured_from)
+            or (captured_before is not None and captured.date() >= captured_before)
+        )
 
     matched: list[Asset] = []
+    present: set[str] = set()
     # Photos stores originals in hexadecimal shard directories; recurse so the
     # tool also works with libraries that add another level of sharding.
     for path in sorted(source.rglob("*")):
-        if not path.is_file() or path.name.startswith(".") or path.suffix.lower() == ".aae":
+        if path.name.startswith(".") or path.suffix.lower() == ".aae":
             continue
         match = UUID_RE.match(path.name)
+        if limit is not None and len(matched) >= limit:
+            # Past the limit, only record which originals exist on disk.
+            # Shard directory names never match UUID_RE, so no stat is needed.
+            if match:
+                present.add(match.group("uuid").upper())
+            continue
+        if not path.is_file():
+            continue
         if not match:
             issues.append(f"unrecognized source filename: {path}")
             continue
         uuid = match.group("uuid").upper()
+        present.add(uuid)
         if uuid in trashed:
             continue
         metadata = assets.get(uuid)
@@ -272,14 +341,19 @@ def load_assets(
                 issues.append(f"unable to read source timestamps for {path}: {exc}")
                 continue
         name, captured = metadata
-        if captured_from is not None and captured.date() < captured_from:
-            continue
-        if captured_before is not None and captured.date() >= captured_before:
+        if not in_capture_range(captured):
             continue
         matched.append(Asset(uuid, path, name, captured, match.group("part")))
-        if limit is not None and len(matched) >= limit:
-            break
-    return matched, issues
+
+    missing = sorted(
+        (assets[uuid][1], uuid)
+        for uuid in expected_local - present
+        if in_capture_range(assets[uuid][1])
+    )
+    missing_originals = [
+        f"{uuid} {assets[uuid][0]} (captured {captured.isoformat(sep=' ')})" for captured, uuid in missing
+    ]
+    return LibraryScan(matched, issues, missing_originals)
 
 
 def sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -312,7 +386,7 @@ def has_sibling_sidecar(destination: Path) -> bool:
     """
     if sidecar_path(destination).exists():
         return True
-    return any(destination.parent.glob(f"{destination.stem}.*.xmp"))
+    return any(destination.parent.glob(f"{glob.escape(destination.stem)}.*.xmp"))
 
 
 class SidecarRenderer:
@@ -490,7 +564,9 @@ def sync(
                     counts["skipped"] += 1
                     details["skipped"].append(str(destination))
                     _progress("skipped", str(destination))
-                elif has_sibling_sidecar(destination):
+                elif sidecar_path(destination).exists() or (
+                    asset.part is not None and has_sibling_sidecar(destination)
+                ):
                     # Media file was modified in place by a prior real
                     # `osxphotos export --exiftool` run (bytes differ from the
                     # raw Photos original by design). Trust it because a
@@ -498,7 +574,9 @@ def sync(
                     # video companion, for its paired still image) -- don't
                     # try to byte-match against historical exiftool output,
                     # which is inherently unstable as Photos metadata keeps
-                    # changing.
+                    # changing. The sibling fallback is limited to companion
+                    # resources: an unrelated sibling such as the RAW half of
+                    # a RAW+JPEG pair must not hide a genuine conflict.
                     counts["legacy"] += 1
                     details["legacy"].append(str(destination))
                     _progress("legacy", str(destination))
@@ -581,9 +659,18 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise SystemExit("target directory must not be inside the source directory")
     print("Scanning source directory and Photos database for assets to sync...", file=sys.stderr, flush=True)
-    assets, issues = load_assets(database, source, args.limit, args.after,
-                                 args.captured_from, args.captured_before)
+    scan = scan_library(database, source, args.limit, args.after,
+                        args.captured_from, args.captured_before)
+    assets, issues = scan.assets, scan.issues
     print(f"Found {len(assets)} assets to sync ({len(issues)} issues).", file=sys.stderr, flush=True)
+    if scan.missing_originals:
+        print(
+            f"warning: {len(scan.missing_originals)} assets have no original on disk and cannot be "
+            "archived (see \"missing_originals\" in the report). If Photos uses \"Optimize Mac "
+            "Storage\", select \"Download Originals to this Mac\" in Photos > Settings > iCloud "
+            "and wait for the download to finish.",
+            file=sys.stderr, flush=True,
+        )
     sidecar_renderer = None
     if args.sidecar:
         sidecar_renderer = SidecarRenderer(database)
@@ -592,13 +679,16 @@ def main(argv: list[str] | None = None) -> int:
     result["source"] = str(source)
     result["target"] = str(target)
     result["issues"] = issues
+    result["missing_originals"] = scan.missing_originals
+    result["counts"]["missing_original"] = len(scan.missing_originals)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     if args.report:
         write_text_atomic(
             args.report.expanduser(),
             json.dumps(result, indent=2, ensure_ascii=False) + "\n",
         )
-    return 1 if result["counts"].get("conflict", 0) or result["counts"].get("failure", 0) or issues else 0
+    counts = result["counts"]
+    return 1 if counts["conflict"] or counts["failure"] or counts["missing_original"] or issues else 0
 
 
 if __name__ == "__main__":
